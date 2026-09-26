@@ -1,0 +1,34 @@
+[Unit]
+Description=Resonance Telegram event registration bot
+Wants=network-online.target postgresql.service
+After=network-online.target postgresql.service
+
+[Service]
+Type=simple
+User=resonance
+Group=resonance
+WorkingDirectory=/opt/resonance-bot
+EnvironmentFile=/opt/resonance-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/resonance-bot/.venv/bin/python -m resonance_bot
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+
+# Basic service hardening. The bot does not need to write to the application directory.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
+
