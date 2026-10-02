@@ -143,7 +143,9 @@ async def contact(message: Message, settings: Settings) -> None:
     )
 
 
-@router.message(F.text == "Ближайшие события")
+@router.message(
+    (F.text == "Записаться на событие") | (F.text == "Ближайшие события")
+)
 async def upcoming(
     message: Message,
     session_factory: async_sessionmaker[AsyncSession],
@@ -218,7 +220,11 @@ async def _send_upcoming(
     if has_next:
         builder.button(text="Дальше →", callback_data=f"events:page:{page + 1}")
     builder.adjust(1)
-    await message.answer("<b>Ближайшие события</b>", reply_markup=builder.as_markup())
+    await message.answer(
+        "<b>Ближайшие события</b>\n"
+        "Выбери событие, чтобы посмотреть подробности и записаться ↓",
+        reply_markup=builder.as_markup(),
+    )
 
 
 @router.callback_query(F.data.startswith("events:page:"))

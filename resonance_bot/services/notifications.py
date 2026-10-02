@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape
 
 from aiogram import Bot
@@ -177,9 +177,22 @@ class NotificationService:
                 )
             )
 
-    async def all_user_ids(self) -> list[int]:
+    async def invitation_recipient_ids(self) -> list[int]:
+        cutoff = datetime.now(UTC) - timedelta(days=90)
+        recent_registration = (
+            select(Registration.id)
+            .where(
+                Registration.user_id == User.telegram_user_id,
+                Registration.registered_at > cutoff,
+            )
+            .exists()
+        )
         async with self.session_factory() as session:
-            return list(await session.scalars(select(User.telegram_user_id)))
+            return list(
+                await session.scalars(
+                    select(User.telegram_user_id).where(~recent_registration)
+                )
+            )
 
     async def broadcast(
         self,

@@ -18,7 +18,7 @@ from resonance_bot.utils.formatting import event_deep_link
 def user_menu(settings: Settings) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Ближайшие события")],
+            [KeyboardButton(text="Записаться на событие")],
             [KeyboardButton(text="Мои записи")],
             [KeyboardButton(text="Написать организатору")],
         ],

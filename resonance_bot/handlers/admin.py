@@ -1146,7 +1146,7 @@ async def broadcast_confirm(
     ids = (
         await notifications.event_participant_ids(event_id)
         if event_id
-        else await notifications.all_user_ids()
+        else await notifications.invitation_recipient_ids()
     )
     summary = await notifications.broadcast(
         ids,
