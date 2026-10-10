@@ -209,9 +209,11 @@ async def _send_upcoming(
         if event.status == EventStatus.REGISTRATION_CLOSED:
             state_label = "запись закрыта"
         elif active + reserved >= event.capacity:
-            state_label = "лист ожидания"
+            state_label = "Мест нет"
+        elif event.capacity - active >= 6:
+            state_label = "Места есть"
         else:
-            state_label = f"мест: {event.capacity - active}"
+            state_label = "Остались последние места"
         local_date = event.starts_at.astimezone(settings.tz).strftime("%d.%m")
         label = f"{event.title} · {local_date} · {state_label}"
         builder.button(text=label, callback_data=f"event:view:{event.id}")

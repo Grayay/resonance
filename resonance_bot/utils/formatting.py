@@ -45,9 +45,11 @@ def event_card(
     free = max(event.capacity - active, 0)
     if event.status == EventStatus.REGISTRATION_OPEN:
         if active + reserved >= event.capacity:
-            availability = "Все доступные места заняты или предложены листу ожидания"
+            availability = "Мест нет"
+        elif free >= 6:
+            availability = "Места есть"
         else:
-            availability = f"Осталось мест: <b>{free}</b>"
+            availability = "Остались последние места"
     else:
         availability = STATUS_LABELS[event.status]
     return (
