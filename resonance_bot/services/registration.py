@@ -11,6 +11,8 @@ from resonance_bot.db.models import (
     Event,
     EventStatus,
     JobStatus,
+    PaymentReceipt,
+    PaymentStatus,
     Registration,
     RegistrationStatus,
     Reminder,
@@ -69,6 +71,7 @@ class Promotion:
 class CancelOutcome:
     cancelled: bool
     promotion: Promotion | None = None
+    refund_required: bool = False
 
 
 @dataclass(slots=True)
@@ -142,7 +145,7 @@ class RegistrationService:
             if waitlist:
                 waitlist.status = WaitlistStatus.ACCEPTED
                 waitlist.responded_at = now
-            await self._schedule_jobs(session, event, registration, now)
+            await self._prepare_registration(session, event, registration, now)
             return RegistrationOutcome(RegistrationResult.REGISTERED, registration.id)
 
     async def join_waitlist(
@@ -210,6 +213,14 @@ class RegistrationService:
             registration.status = RegistrationStatus.CANCELLED
             registration.cancelled_at = now
             await session.execute(
+                update(PaymentReceipt)
+                .where(
+                    PaymentReceipt.registration_id == registration.id,
+                    PaymentReceipt.payment_cycle == registration.payment_cycle,
+                )
+                .values(cancelled_at=now)
+            )
+            await session.execute(
                 update(Reminder)
                 .where(
                     Reminder.registration_id == registration.id,
@@ -218,7 +229,9 @@ class RegistrationService:
                 .values(status=JobStatus.SKIPPED)
             )
             promotion = await self._promote_next(session, event, now)
-            return CancelOutcome(True, promotion)
+            return CancelOutcome(
+                True, promotion, registration.payment_status == PaymentStatus.RECEIVED
+            )
 
     async def accept_offer(
         self, entry_id: int, user_id: int, *, now: datetime | None = None
@@ -288,7 +301,7 @@ class RegistrationService:
                 registration.reminder_confirmed_at = None
             entry.status = WaitlistStatus.ACCEPTED
             entry.responded_at = now
-            await self._schedule_jobs(session, event, registration, now)
+            await self._prepare_registration(session, event, registration, now)
             return OfferOutcome(OfferResult.ACCEPTED, registration.id)
 
     async def decline_offer(
@@ -395,6 +408,9 @@ class RegistrationService:
     async def _promote_next(
         self, session: AsyncSession, event: Event, now: datetime
     ) -> Promotion | None:
+        # The production factory disables autoflush. Capacity must see the
+        # cancellation/offer response made earlier in this transaction.
+        await session.flush()
         if event.status != EventStatus.REGISTRATION_OPEN or as_utc(event.starts_at) <= now:
             return None
         active, reserved = await self._occupancy(session, event.id)
@@ -418,7 +434,7 @@ class RegistrationService:
         await session.flush()
         return Promotion(entry.id, event.id, entry.user_id, entry.offer_expires_at)
 
-    async def _schedule_jobs(
+    async def _prepare_registration(
         self, session: AsyncSession, event: Event, registration: Registration, now: datetime
     ) -> None:
         await session.execute(
@@ -429,6 +445,11 @@ class RegistrationService:
             )
             .values(status=JobStatus.SKIPPED)
         )
+        registration.payment_status = (
+            PaymentStatus.PENDING if event.is_paid else PaymentStatus.NOT_REQUIRED
+        )
+        registration.payment_amount = event.price if event.is_paid else None
+        registration.payment_cycle = registration.payment_cycle + 1 if event.is_paid else 0
         for offset in sorted(set(event.reminder_offsets_hours or []), reverse=True):
             scheduled_at = as_utc(event.starts_at) - timedelta(hours=offset)
             if scheduled_at > now:

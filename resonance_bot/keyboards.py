@@ -82,7 +82,11 @@ def cancel_confirm_keyboard(event_id: int) -> InlineKeyboardMarkup:
                     text="Да, отменить запись", callback_data=f"cancel:yes:{event_id}"
                 )
             ],
-            [InlineKeyboardButton(text="Оставить запись", callback_data=f"cancel:no:{event_id}")],
+            [
+                InlineKeyboardButton(
+                    text="Нет, оставить запись", callback_data=f"cancel:no:{event_id}"
+                )
+            ],
         ]
     )
 
@@ -137,6 +141,11 @@ def feedback_keyboard(registration_id: int) -> InlineKeyboardMarkup:
 def admin_event_keyboard(event: Event) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="Участники", callback_data=f"admin:event:{event.id}:participants")
+    if event.is_paid:
+        builder.button(text="Все записавшиеся", callback_data=f"payments:{event.id}:all:0")
+        builder.button(text="Оплатили", callback_data=f"payments:{event.id}:paid:0")
+        builder.button(text="Ожидают оплату", callback_data=f"payments:{event.id}:pending:0")
+        builder.button(text="Чеки", callback_data=f"payments:{event.id}:receipts:0")
     builder.button(text="Рассылка участникам", callback_data=f"admin:event:{event.id}:broadcast")
     builder.button(text="Редактировать", callback_data=f"admin:event:{event.id}:edit")
     if event.status == EventStatus.REGISTRATION_OPEN:

@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -36,6 +38,12 @@ class RegistrationStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class PaymentStatus(StrEnum):
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    RECEIVED = "received"
+
+
 class WaitlistStatus(StrEnum):
     WAITING = "waiting"
     OFFERED = "offered"
@@ -48,6 +56,7 @@ class WaitlistStatus(StrEnum):
 class ReminderKind(StrEnum):
     EVENT = "event"
     FEEDBACK = "feedback"
+    PAYMENT = "payment"
 
 
 class JobStatus(StrEnum):
@@ -97,6 +106,8 @@ class Event(Base):
     address: Mapped[str] = mapped_column(String(500))
     map_url: Mapped[str] = mapped_column(String(1000))
     cover_file_id: Mapped[str | None] = mapped_column(String(512))
+    is_paid: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    price: Mapped[int | None] = mapped_column(Integer)
     capacity: Mapped[int] = mapped_column(Integer)
     status: Mapped[EventStatus] = mapped_column(
         Enum(EventStatus, name="event_status", native_enum=False),
@@ -116,6 +127,10 @@ class Event(Base):
 
     __table_args__ = (
         Index("ix_events_upcoming", "status", "starts_at"),
+        CheckConstraint(
+            "(is_paid AND price IS NOT NULL AND price > 0) OR (NOT is_paid AND price IS NULL)",
+            name="ck_events_payment_price",
+        ),
     )
 
 
@@ -138,11 +153,48 @@ class Registration(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reminder_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    payment_status: Mapped[PaymentStatus] = mapped_column(
+        Enum(PaymentStatus, name="payment_status", native_enum=False),
+        default=PaymentStatus.NOT_REQUIRED,
+        server_default="NOT_REQUIRED",
+        index=True,
+    )
+    payment_amount: Mapped[int | None] = mapped_column(Integer)
+    payment_cycle: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
     event: Mapped[Event] = relationship(back_populates="registrations")
     user: Mapped[User] = relationship(back_populates="registrations")
     feedback: Mapped[Feedback | None] = relationship(back_populates="registration", uselist=False)
 
-    __table_args__ = (UniqueConstraint("event_id", "user_id", name="uq_registration_event_user"),)
+    __table_args__ = (
+        UniqueConstraint("event_id", "user_id", name="uq_registration_event_user"),
+        CheckConstraint(
+            "(payment_status = 'NOT_REQUIRED' AND payment_amount IS NULL AND payment_cycle = 0) OR "
+            "(payment_status IN ('PENDING', 'RECEIVED') AND payment_amount IS NOT NULL "
+            "AND payment_amount > 0 AND payment_cycle > 0)",
+            name="ck_registration_payment",
+        ),
+    )
+
+
+class PaymentReceipt(Base):
+    __tablename__ = "payment_receipts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    registration_id: Mapped[int] = mapped_column(
+        ForeignKey("registrations.id", ondelete="RESTRICT")
+    )
+    payment_cycle: Mapped[int] = mapped_column(Integer)
+    amount: Mapped[int] = mapped_column(Integer)
+    file_id: Mapped[str] = mapped_column(String(512))
+    file_unique_id: Mapped[str | None] = mapped_column(String(255))
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("registration_id", "payment_cycle", name="uq_receipt_payment_cycle"),
+        CheckConstraint("amount > 0 AND payment_cycle > 0", name="ck_receipt_payment"),
+    )
 
 
 class WaitlistEntry(Base):

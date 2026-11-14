@@ -103,7 +103,11 @@ async def reschedule_registration_jobs(
         return
     await session.execute(
         update(Reminder)
-        .where(Reminder.registration_id.in_(registration_ids), Reminder.status == JobStatus.PENDING)
+        .where(
+            Reminder.registration_id.in_(registration_ids),
+            Reminder.status == JobStatus.PENDING,
+            Reminder.kind != ReminderKind.PAYMENT,
+        )
         .values(status=JobStatus.SKIPPED)
     )
     for registration_id in registration_ids:

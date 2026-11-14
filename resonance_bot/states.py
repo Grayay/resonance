@@ -4,6 +4,8 @@ from aiogram.fsm.state import State, StatesGroup
 class EventCreation(StatesGroup):
     title = State()
     description = State()
+    event_type = State()
+    price = State()
     event_date = State()
     start_time = State()
     venue_name = State()
@@ -34,3 +36,6 @@ class AdminManagement(StatesGroup):
 class FeedbackComment(StatesGroup):
     text = State()
 
+
+class ReceiptSelection(StatesGroup):
+    event = State()

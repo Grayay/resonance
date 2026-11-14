@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import CommandStart
 from aiogram.filters.command import CommandObject
 from aiogram.fsm.context import FSMContext
@@ -16,6 +17,7 @@ from resonance_bot.db.models import (
     Event,
     EventStatus,
     Feedback,
+    PaymentStatus,
     Registration,
     RegistrationStatus,
     WaitlistEntry,
@@ -28,13 +30,21 @@ from resonance_bot.keyboards import (
     user_menu,
 )
 from resonance_bot.services.notifications import NotificationService
+from resonance_bot.services.payments import (
+    RECEIPT_CONFIRMATION,
+    REFUND_MESSAGE,
+    attach_receipt,
+    pending_payments,
+    receipt_used,
+)
 from resonance_bot.services.registration import (
     OfferResult,
     RegistrationResult,
     RegistrationService,
     WaitlistResult,
+    as_utc,
 )
-from resonance_bot.states import FeedbackComment
+from resonance_bot.states import FeedbackComment, ReceiptSelection
 from resonance_bot.utils.dates import human_datetime
 from resonance_bot.utils.formatting import event_card, registration_success
 
@@ -94,7 +104,7 @@ async def send_event_card(
         await message.answer("Это мероприятие не найдено или больше недоступно.")
         return
     now = datetime.now(UTC)
-    if event.starts_at <= now:
+    if as_utc(event.starts_at) <= now:
         await message.answer("Это мероприятие уже прошло.")
         return
     text = event_card(event, settings, active=active, reserved=reserved)
@@ -253,6 +263,34 @@ async def view_event(
     )
 
 
+async def _send_registration_success(
+    message: Message,
+    registration_id: int,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                select(Registration, Event)
+                .join(Event, Registration.event_id == Event.id)
+                .where(Registration.id == registration_id)
+            )
+        ).one_or_none()
+    if row is None:
+        return
+    registration, event = row
+    await message.answer(
+        registration_success(
+            event,
+            settings,
+            payment_pending=registration.payment_status == PaymentStatus.PENDING,
+            payment_amount=registration.payment_amount,
+        ),
+        reply_markup=event_keyboard(event, settings, registered=True),
+    )
+
+
 @router.callback_query(F.data.startswith("event:register:"))
 async def register(
     callback: CallbackQuery,
@@ -263,14 +301,13 @@ async def register(
     event_id = int(callback.data.rsplit(":", 1)[1])
     outcome = await registration_service.register(event_id, callback.from_user.id)
     await callback.answer()
-    async with session_factory() as session:
-        event = await session.get(Event, event_id)
     if outcome.result in (RegistrationResult.REGISTERED, RegistrationResult.ALREADY_REGISTERED):
-        if event:
-            await callback.message.answer(
-                registration_success(event, settings),
-                reply_markup=event_keyboard(event, settings, registered=True),
-            )
+        await _send_registration_success(
+            callback.message,
+            outcome.registration_id,
+            session_factory,
+            settings,
+        )
     elif outcome.result == RegistrationResult.FULL:
         await callback.message.answer(
             "На это мероприятие сейчас все места заняты.\n"
@@ -311,15 +348,15 @@ async def join_waitlist(
         )
     elif outcome.result == WaitlistResult.PLACE_AVAILABLE:
         outcome_registration = await registration_service.register(event_id, callback.from_user.id)
-        async with session_factory() as session:
-            event = await session.get(Event, event_id)
         if outcome_registration.result in (
             RegistrationResult.REGISTERED,
             RegistrationResult.ALREADY_REGISTERED,
-        ) and event:
-            await callback.message.answer(
-                registration_success(event, settings),
-                reply_markup=event_keyboard(event, settings, registered=True),
+        ):
+            await _send_registration_success(
+                callback.message,
+                outcome_registration.registration_id,
+                session_factory,
+                settings,
             )
         else:
             await callback.message.answer(
@@ -334,7 +371,7 @@ async def ask_cancel(callback: CallbackQuery) -> None:
     event_id = int(callback.data.rsplit(":", 1)[1])
     await callback.answer()
     await callback.message.answer(
-        "Точно отменить запись? Освободившееся место может сразу перейти другому участнику.",
+        "Точно отменить запись?",
         reply_markup=cancel_confirm_keyboard(event_id),
     )
 
@@ -357,7 +394,9 @@ async def cancel_registration(
     await callback.message.edit_reply_markup(reply_markup=None)
     if outcome.cancelled:
         await callback.message.answer(
-            "Спасибо за предупреждение. Ждём тебя в другой раз!"
+            REFUND_MESSAGE
+            if outcome.refund_required
+            else "Спасибо за предупреждение. Ждём тебя в другой раз!"
         )
         if outcome.promotion:
             await notifications.send_promotion(outcome.promotion)
@@ -378,14 +417,12 @@ async def accept_offer(
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
     if outcome.result in (OfferResult.ACCEPTED, OfferResult.ALREADY_REGISTERED):
-        async with session_factory() as session:
-            registration = await session.get(Registration, outcome.registration_id)
-            event = await session.get(Event, registration.event_id) if registration else None
-        if event:
-            await callback.message.answer(
-                registration_success(event, settings),
-                reply_markup=event_keyboard(event, settings, registered=True),
-            )
+        await _send_registration_success(
+            callback.message,
+            outcome.registration_id,
+            session_factory,
+            settings,
+        )
     elif outcome.result == OfferResult.EXPIRED:
         await callback.message.answer("Срок предложения уже истёк.")
     else:
@@ -528,6 +565,108 @@ async def feedback_skip(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer("Спасибо за отзыв!")
+
+
+async def _restore_receipt_state(state: FSMContext, data: dict) -> None:
+    resume = data["receipt_resume"]
+    await state.set_state(resume["state"])
+    await state.set_data(resume["data"])
+
+
+@router.message(F.photo, F.chat.type == "private")
+async def receipt_photo(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    file_id, file_unique_id = message.photo[-1].file_id, message.photo[-1].file_unique_id
+    current_state, data = await state.get_state(), await state.get_data()
+    selecting = current_state == ReceiptSelection.event.state
+    async with session_factory() as session:
+        rows = await pending_payments(session, message.from_user.id)
+        duplicate = await receipt_used(session, message.from_user.id, file_id, file_unique_id)
+    if not rows or duplicate:
+        if selecting:
+            await _restore_receipt_state(state, data)
+        elif current_state and not rows:
+            # Let the original feedback/unrelated handler retain its behavior.
+            raise SkipHandler
+        await message.answer(
+            "Этот чек уже получен. Повторная оплата не создана."
+            if duplicate
+            else "Сейчас нет платной записи, ожидающей подтверждения оплаты."
+        )
+        return
+    if len(rows) == 1:
+        registration = rows[0][0]
+        saved = await attach_receipt(
+            session_factory,
+            registration.id,
+            message.from_user.id,
+            file_id,
+            file_unique_id=file_unique_id,
+            expected_cycle=registration.payment_cycle,
+        )
+        if selecting:
+            await _restore_receipt_state(state, data)
+        await message.answer(
+            RECEIPT_CONFIRMATION if saved else "Запись уже изменилась. Проверьте мои записи."
+        )
+        return
+    resume = data["receipt_resume"] if selecting else {"state": current_state, "data": data}
+    await state.set_state(ReceiptSelection.event)
+    await state.set_data(
+        dict(
+            receipt_file_id=file_id,
+            receipt_unique_id=file_unique_id,
+            receipt_message_id=message.message_id,
+            receipt_resume=resume,
+            receipt_cycles={str(reg.id): reg.payment_cycle for reg, _ in rows},
+        )
+    )
+    builder = InlineKeyboardBuilder()
+    for registration, event in rows:
+        builder.button(
+            text=event.title[:100],
+            callback_data=f"receipt:{message.message_id}:{registration.id}",
+        )
+    builder.adjust(1)
+    await message.answer(
+        "К какому мероприятию относится эта оплата?", reply_markup=builder.as_markup()
+    )
+
+
+@router.callback_query(F.data.startswith("receipt:"))
+async def receipt_selection(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    _, message_id, registration_id = callback.data.split(":")
+    data = await state.get_data()
+    if (
+        await state.get_state() != ReceiptSelection.event.state
+        or data.get("receipt_message_id") != int(message_id)
+        or registration_id not in data.get("receipt_cycles", {})
+    ):
+        await callback.answer("Этот выбор уже недоступен. Отправьте чек заново.", show_alert=True)
+        return
+    saved = await attach_receipt(
+        session_factory,
+        int(registration_id),
+        callback.from_user.id,
+        data["receipt_file_id"],
+        file_unique_id=data["receipt_unique_id"],
+        expected_cycle=data["receipt_cycles"][registration_id],
+    )
+    await _restore_receipt_state(state, data)
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer(
+        RECEIPT_CONFIRMATION
+        if saved
+        else "Запись уже изменилась. Отправьте чек заново для актуальной записи."
+    )
 
 
 @router.message(FeedbackComment.text)

@@ -15,6 +15,7 @@ from resonance_bot.db.models import (
     Event,
     EventStatus,
     JobStatus,
+    PaymentStatus,
     Registration,
     RegistrationStatus,
     Reminder,
@@ -25,7 +26,8 @@ from resonance_bot.db.models import (
 )
 from resonance_bot.keyboards import day_reminder_keyboard, feedback_keyboard, reminder_keyboard
 from resonance_bot.services.notifications import NotificationService
-from resonance_bot.services.registration import RegistrationService
+from resonance_bot.services.payments import payment_request
+from resonance_bot.services.registration import RegistrationService, as_utc
 from resonance_bot.utils.dates import human_date, human_time
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,7 @@ class PersistentScheduler:
         while not self._stop.is_set():
             try:
                 await self._recover_stale_jobs()
+                await self._schedule_payment_reminders()
                 await self._process_due_reminders()
                 await self._process_expired_offers()
                 await self._finish_past_events()
@@ -75,6 +78,17 @@ class PersistentScheduler:
     async def _recover_stale_jobs(self) -> None:
         cutoff = datetime.now(UTC) - timedelta(minutes=10)
         async with self.session_factory() as session, session.begin():
+            # A crashed payment delivery has an uncertain Telegram outcome. Do not
+            # retry it on the same day; normal reminders retain their retry policy.
+            await session.execute(
+                update(Reminder)
+                .where(
+                    Reminder.status == JobStatus.PROCESSING,
+                    Reminder.locked_at < cutoff,
+                    Reminder.kind == ReminderKind.PAYMENT,
+                )
+                .values(status=JobStatus.SKIPPED, locked_at=None)
+            )
             await session.execute(
                 update(Reminder)
                 .where(Reminder.status == JobStatus.PROCESSING, Reminder.locked_at < cutoff)
@@ -105,6 +119,116 @@ class PersistentScheduler:
                 break
             await self._deliver_job(job_id)
 
+    async def _schedule_payment_reminders(self, *, now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
+        local_day = now.astimezone(self.settings.tz).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        scheduled_at = local_day.astimezone(UTC)
+        async with self.session_factory() as session, session.begin():
+            registrations = list(
+                await session.scalars(
+                    select(Registration)
+                    .join(Event, Registration.event_id == Event.id)
+                    .where(
+                        Registration.status == RegistrationStatus.REGISTERED,
+                        Registration.payment_status == PaymentStatus.PENDING,
+                        Registration.registered_at < scheduled_at,
+                        Event.is_paid.is_(True),
+                        Event.starts_at > now,
+                        ~select(Reminder.id)
+                        .where(
+                            Reminder.registration_id == Registration.id,
+                            Reminder.kind == ReminderKind.PAYMENT,
+                            Reminder.scheduled_at == scheduled_at,
+                        )
+                        .exists(),
+                        Event.status.in_(
+                            [
+                                EventStatus.REGISTRATION_OPEN,
+                                EventStatus.REGISTRATION_CLOSED,
+                            ]
+                        ),
+                    )
+                    .with_for_update(of=Registration, skip_locked=True)
+                )
+            )
+            for registration in registrations:
+                # Recheck after locking in case another worker committed after
+                # the initial query's snapshot. Completed days cost one query.
+                exists = await session.scalar(
+                    select(Reminder.id).where(
+                        Reminder.registration_id == registration.id,
+                        Reminder.kind == ReminderKind.PAYMENT,
+                        Reminder.scheduled_at == scheduled_at,
+                    )
+                )
+                if exists is None:
+                    session.add(
+                        Reminder(
+                            registration_id=registration.id,
+                            kind=ReminderKind.PAYMENT,
+                            offset_hours=0,
+                            scheduled_at=scheduled_at,
+                        )
+                    )
+
+    async def _deliver_payment_job(self, job_id: int) -> None:
+        async with self.session_factory() as session, session.begin():
+            event_id = await session.scalar(
+                select(Registration.event_id)
+                .join(
+                    Reminder,
+                    Reminder.registration_id == Registration.id,
+                )
+                .where(Reminder.id == job_id)
+            )
+            event = await session.scalar(
+                select(Event).where(Event.id == event_id).with_for_update()
+            )
+            registration = await session.scalar(
+                select(Registration)
+                .join(
+                    Reminder,
+                    Reminder.registration_id == Registration.id,
+                )
+                .where(Reminder.id == job_id)
+                .with_for_update(of=Registration)
+            )
+            job = await session.get(Reminder, job_id, with_for_update=True)
+            if job is None or job.status != JobStatus.PROCESSING:
+                return
+            now = datetime.now(UTC)
+            if (
+                event is None
+                or registration is None
+                or not event.is_paid
+                or registration.status != RegistrationStatus.REGISTERED
+                or registration.payment_status != PaymentStatus.PENDING
+                or event.status
+                not in (
+                    EventStatus.REGISTRATION_OPEN,
+                    EventStatus.REGISTRATION_CLOSED,
+                )
+                or as_utc(event.starts_at) <= now
+                or as_utc(job.scheduled_at).astimezone(self.settings.tz).date()
+                != now.astimezone(self.settings.tz).date()
+            ):
+                job.status = JobStatus.SKIPPED
+            else:
+                try:
+                    await self.bot.send_message(
+                        registration.user_id,
+                        payment_request(event, registration.payment_amount, reminder=True),
+                    )
+                    job.status = JobStatus.SENT
+                    job.sent_at = now
+                except TelegramAPIError:
+                    logger.warning("Payment reminder %s could not be delivered", job_id)
+                    job.status = JobStatus.FAILED
+                    job.last_error = "Telegram delivery failed; no same-day retry"
+            job.locked_at = None
+
     async def _deliver_job(self, job_id: int) -> None:
         async with self.session_factory() as session:
             row = (
@@ -119,6 +243,9 @@ class PersistentScheduler:
         if row is None:
             return
         job, registration, event, user = row
+        if job.kind == ReminderKind.PAYMENT:
+            await self._deliver_payment_job(job_id)
+            return
         if (
             registration.status != RegistrationStatus.REGISTERED
             or event.status == EventStatus.CANCELLED

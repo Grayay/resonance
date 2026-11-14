@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from html import escape
 
@@ -11,6 +12,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -24,6 +26,7 @@ from resonance_bot.db.models import (
     EventStatus,
     Feedback,
     JobStatus,
+    PaymentStatus,
     Registration,
     RegistrationStatus,
     Reminder,
@@ -35,6 +38,13 @@ from resonance_bot.keyboards import admin_event_keyboard, admin_menu
 from resonance_bot.services.events import event_stats, reschedule_registration_jobs
 from resonance_bot.services.exports import event_csv
 from resonance_bot.services.notifications import NotificationService
+from resonance_bot.services.payments import (
+    event_receipts,
+    payment_counts,
+    payment_participants,
+    positive_price,
+)
+from resonance_bot.services.registration import as_utc
 from resonance_bot.services.users import is_admin
 from resonance_bot.states import AdminManagement, Broadcast, EventCreation, EventEdit
 from resonance_bot.utils.dates import combine_local, human_datetime, parse_date, parse_time
@@ -44,9 +54,11 @@ from resonance_bot.utils.formatting import (
     event_announcement,
     event_deep_link,
     event_schedule_cta,
+    participant_line,
 )
 
 router = Router(name="admin")
+logger = logging.getLogger(__name__)
 
 
 async def _authorized(
@@ -154,6 +166,59 @@ async def create_description(message: Message, state: FSMContext, settings: Sett
         await message.answer("Текст должен содержать от 1 до 3500 символов.")
         return
     await state.update_data(description=message.text.strip())
+    data = await state.get_data()
+    if not data.get("editing_preview"):
+        await state.set_state(EventCreation.event_type)
+        await message.answer("Тип мероприятия:", reply_markup=_event_type_keyboard())
+        return
+    await _after_value(
+        message,
+        state,
+        EventCreation.event_date,
+        "Дата мероприятия в формате ДД.ММ.ГГГГ:",
+        settings,
+    )
+
+
+def _event_type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Бесплатное", callback_data="create:type:free")],
+            [InlineKeyboardButton(text="Платное", callback_data="create:type:paid")],
+        ]
+    )
+
+
+@router.callback_query(EventCreation.event_type, F.data.startswith("create:type:"))
+async def create_type(callback: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    value = callback.data.rsplit(":", 1)[1]
+    if value not in {"free", "paid"}:
+        await callback.answer("Выберите тип кнопкой")
+        return
+    await state.update_data(is_paid=value == "paid", price=None)
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    if value == "paid":
+        await state.set_state(EventCreation.price)
+        await callback.message.answer("Цена билета в рублях (положительное целое число):")
+    else:
+        await _after_value(
+            callback.message,
+            state,
+            EventCreation.event_date,
+            "Дата мероприятия в формате ДД.ММ.ГГГГ:",
+            settings,
+        )
+
+
+@router.message(EventCreation.price)
+async def create_price(message: Message, state: FSMContext, settings: Settings) -> None:
+    try:
+        price = positive_price(message.text or "")
+    except ValueError:
+        await message.answer("Цена должна быть положительным целым числом рублей.")
+        return
+    await state.update_data(price=price)
     await _after_value(
         message,
         state,
@@ -317,7 +382,8 @@ def _creation_preview_text(data: dict, settings: Settings) -> str:
         "<b>Предпросмотр</b>\n\n"
         f"<b>{escape(data['title'])}</b>\n\n"
         f"{escape(data['description'])}\n\n"
-        f"📅 {human_datetime(starts_at, settings.tz)}\n"
+        + (f"🎟 билет = {data['price']} ₽\n\n" if data["is_paid"] else "")
+        + f"📅 {human_datetime(starts_at, settings.tz)}\n"
         f"📍 {escape(data['venue_name'])}, {escape(data['address'])}\n"
         f"Мест: {data['capacity']}\n"
         f"Напоминания: за {reminders} ч.\n"
@@ -348,6 +414,8 @@ async def _show_creation_preview(
 CREATE_FIELDS = {
     "title": ("Название", EventCreation.title),
     "description": ("Текст анонса", EventCreation.description),
+    "event_type": ("Тип мероприятия", EventCreation.event_type),
+    "price": ("Цена", EventCreation.price),
     "event_date": ("Дата", EventCreation.event_date),
     "start_time": ("Время", EventCreation.start_time),
     "venue_name": ("Площадка", EventCreation.venue_name),
@@ -361,9 +429,12 @@ CREATE_FIELDS = {
 
 
 @router.callback_query(EventCreation.preview, F.data == "create:edit")
-async def creation_edit(callback: CallbackQuery) -> None:
+async def creation_edit(callback: CallbackQuery, state: FSMContext) -> None:
     builder = InlineKeyboardBuilder()
+    data = await state.get_data()
     for field, (label, _) in CREATE_FIELDS.items():
+        if field == "price" and not data.get("is_paid"):
+            continue
         builder.button(text=label, callback_data=f"create:field:{field}")
     builder.adjust(2)
     await callback.answer()
@@ -377,11 +448,17 @@ async def creation_edit_field(callback: CallbackQuery, state: FSMContext) -> Non
     if not definition:
         await callback.answer("Неизвестное поле")
         return
+    if field == "price" and not (await state.get_data()).get("is_paid"):
+        await callback.answer("У бесплатного мероприятия нет цены", show_alert=True)
+        return
     label, target_state = definition
     await state.update_data(editing_preview=True)
     await state.set_state(target_state)
     await callback.answer()
-    await callback.message.answer(f"Введи новое значение поля «{label}»:")
+    await callback.message.answer(
+        f"Введи новое значение поля «{label}»:",
+        reply_markup=_event_type_keyboard() if field == "event_type" else None,
+    )
 
 
 @router.callback_query(EventCreation.preview, F.data == "create:cancel")
@@ -423,6 +500,8 @@ async def _save_created_event(
             map_url=data["map_url"],
             cover_file_id=data.get("cover_file_id"),
             capacity=data["capacity"],
+            is_paid=data["is_paid"],
+            price=positive_price(str(data["price"])) if data["is_paid"] else None,
             status=EventStatus.DRAFT,
             reminder_offsets_hours=data["reminder_offsets_hours"],
             feedback_at=feedback_at,
@@ -437,6 +516,7 @@ async def _save_created_event(
         try:
             await notifications.publish_event(event_id)
         except Exception:
+            logger.exception("Could not publish created event %s", event_id)
             await callback.message.answer(
                 "Мероприятие сохранено как черновик, но публикация не удалась. "
                 "Проверь права бота в канале и настройки CHANNEL_ID."
@@ -520,12 +600,15 @@ async def admin_view_event(
             )
             or 0
         )
+        paid, pending = (
+            await payment_counts(session, event_id) if event and event.is_paid else (0, 0)
+        )
     await callback.answer()
     if not event:
         await callback.message.answer("Мероприятие не найдено.")
         return
     await callback.message.answer(
-        admin_event_card(event, settings, active=active),
+        admin_event_card(event, settings, active=active, paid=paid, pending=pending),
         reply_markup=admin_event_keyboard(event),
     )
 
@@ -588,16 +671,7 @@ async def admin_participants(
         "",
     ]
     for registration, user, feedback in rows[:50]:
-        status = "записан" if registration.status == RegistrationStatus.REGISTERED else "отменил"
-        flags = []
-        if registration.reminder_confirmed_at:
-            flags.append("подтвердил")
-        if feedback:
-            flags.append("оставил отзыв")
-        username = f"@{escape(user.username)}" if user.username else f"ID {user.telegram_user_id}"
-        name = escape(" ".join(filter(None, [user.first_name, user.last_name])))
-        suffix = f"; {', '.join(flags)}" if flags else ""
-        lines.append(f"• {name} ({username}) — {status}{suffix}")
+        lines.append(participant_line(registration, user, paid=event.is_paid, feedback=feedback))
     if len(rows) > 50:
         lines.append("\nПоказаны первые 50 записей. Полный список доступен в CSV.")
     if waitlist_rows:
@@ -619,6 +693,80 @@ async def admin_participants(
             )
             lines.append(f"• {name} ({username}) — {waitlist_labels[entry.status]}")
     await callback.message.answer("\n".join(lines))
+
+
+@router.callback_query(F.data.regexp(r"^payments:\d+:(all|paid|pending|receipts):\d+$"))
+async def admin_payments(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    if not await _guard_callback(callback, session_factory, settings):
+        return
+    _, event_raw, view, page_raw = callback.data.split(":")
+    event_id, page = int(event_raw), int(page_raw)
+    async with session_factory() as session:
+        event = await session.get(Event, event_id)
+        if event is None or not event.is_paid:
+            await callback.answer("Платное мероприятие не найдено", show_alert=True)
+            return
+        if view == "receipts":
+            rows = await event_receipts(session, event_id, page)
+        else:
+            payment_filter = {"paid": PaymentStatus.RECEIVED, "pending": PaymentStatus.PENDING}
+            rows = await payment_participants(
+                session, event_id, payment_filter.get(view), page=page
+            )
+    await callback.answer()
+    if not rows:
+        await callback.message.answer(
+            "Чеков пока нет." if view == "receipts" else "В этом списке пока нет участников."
+        )
+        return
+    builder = InlineKeyboardBuilder()
+    if page:
+        builder.button(text="← Назад", callback_data=f"payments:{event_id}:{view}:{page - 1}")
+    if len(rows) > (1 if view == "receipts" else 6):
+        builder.button(text="Дальше →", callback_data=f"payments:{event_id}:{view}:{page + 1}")
+    builder.button(text="К мероприятию", callback_data=f"admin:event:{event_id}:view")
+    builder.adjust(2, 1)
+    if view == "receipts":
+        receipt, user = rows[0]
+        name = " ".join(filter(None, [user.first_name, user.last_name]))[:200]
+        username = f"@{user.username}" if user.username else "—"
+        received_at = human_datetime(receipt.received_at, settings.tz)
+        caption = (
+            f"Чек · {page + 1}\n{name}\nUsername: {username}\n"
+            f"Telegram ID: {user.telegram_user_id}\n{event.title[:255]}\n"
+            f"Сумма: {receipt.amount} ₽\nПолучен: {received_at}\n"
+            + (
+                "Запись отменена — требуется возврат"
+                if receipt.cancelled_at is not None
+                else "Запись активна"
+            )
+        )
+        if callback.message.photo:
+            await callback.message.edit_media(
+                InputMediaPhoto(
+                    media=receipt.file_id,
+                    caption=caption,
+                    parse_mode=None,
+                ),
+                reply_markup=builder.as_markup(),
+            )
+        else:
+            await callback.message.answer_photo(
+                receipt.file_id,
+                caption=caption,
+                parse_mode=None,
+                reply_markup=builder.as_markup(),
+            )
+        return
+    labels = {"all": "Все записавшиеся", "paid": "Оплатили", "pending": "Ожидают оплату"}
+    lines = [f"<b>{escape(event.title)} — {labels[view]}</b>", ""]
+    for registration, user in rows[:6]:
+        lines.append(participant_line(registration, user, paid=True))
+    await callback.message.answer("\n".join(lines), reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.regexp(r"^admin:event:\d+:stats$"))
@@ -730,6 +878,7 @@ async def admin_publish(
     try:
         await notifications.publish_event(event_id)
     except Exception:
+        logger.exception("Could not publish event %s", event_id)
         await callback.message.answer(
             "Не удалось опубликовать. Проверь права бота в канале и настройки CHANNEL_ID."
         )
@@ -847,6 +996,7 @@ async def admin_cancel_event(
 EDIT_FIELDS = {
     "title": "Название",
     "description": "Текст анонса",
+    "price": "Цена",
     "date": "Дата",
     "time": "Время",
     "venue_name": "Площадка",
@@ -870,13 +1020,24 @@ async def admin_edit_event(
     if not await _guard_callback(callback, session_factory, settings):
         return
     event_id = int(callback.data.split(":")[2])
+    async with session_factory() as session:
+        event = await session.get(Event, event_id)
+    if not event:
+        await callback.answer("Мероприятие не найдено", show_alert=True)
+        return
     builder = InlineKeyboardBuilder()
     for field, label in EDIT_FIELDS.items():
+        if field == "price" and not event.is_paid:
+            continue
         builder.button(text=label, callback_data=f"admin:editfield:{event_id}:{field}")
     builder.adjust(2)
     await state.set_state(EventEdit.choosing)
     await callback.answer()
-    await callback.message.answer("Что изменить?", reply_markup=builder.as_markup())
+    await callback.message.answer(
+        "Что изменить? Тип сохранённого мероприятия (платное/бесплатное) изменить нельзя. "
+        "Для другого типа создайте новое мероприятие.",
+        reply_markup=builder.as_markup(),
+    )
 
 
 @router.callback_query(EventEdit.choosing, F.data.startswith("admin:editfield:"))
@@ -886,12 +1047,17 @@ async def admin_choose_edit_field(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
+    if not await _guard_callback(callback, session_factory, settings):
+        return
     _, _, event_raw, field = callback.data.split(":")
     event_id = int(event_raw)
     async with session_factory() as session:
         event = await session.get(Event, event_id)
     if not event:
         await callback.answer("Мероприятие не найдено", show_alert=True)
+        return
+    if field not in EDIT_FIELDS or (field == "price" and not event.is_paid):
+        await callback.answer("Это поле недоступно для мероприятия", show_alert=True)
         return
     if field == "capacity" and event.published_at is not None:
         await callback.answer(
@@ -900,6 +1066,7 @@ async def admin_choose_edit_field(
         return
     prompts = {
         "title": "Новое название:",
+        "price": "Новая цена билета в рублях (положительное целое число):",
         "description": "Новый текст анонса:",
         "date": "Новая дата в формате ДД.ММ.ГГГГ:",
         "time": "Новое время в формате ЧЧ:ММ:",
@@ -936,6 +1103,9 @@ async def admin_save_edit(
             await state.clear()
             await message.answer("Мероприятие не найдено.")
             return
+        event.starts_at = as_utc(event.starts_at)
+        if event.feedback_at is not None:
+            event.feedback_at = as_utc(event.feedback_at)
         feedback_delay = (
             event.feedback_at - event.starts_at if event.feedback_at is not None else None
         )
@@ -944,6 +1114,10 @@ async def admin_save_edit(
                 if not raw or len(raw) > 255:
                     raise ValueError("Название должно содержать до 255 символов")
                 event.title = raw
+            elif field == "price":
+                if not event.is_paid:
+                    raise ValueError("У бесплатного мероприятия нет цены")
+                event.price = positive_price(raw)
             elif field == "description":
                 if not raw or len(raw) > 3500:
                     raise ValueError("Текст должен содержать до 3500 символов")
