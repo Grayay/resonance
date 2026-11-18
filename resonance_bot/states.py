@@ -2,6 +2,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class EventCreation(StatesGroup):
+    channel = State()
     title = State()
     description = State()
     event_type = State()

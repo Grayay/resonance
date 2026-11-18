@@ -49,6 +49,7 @@ from resonance_bot.services.users import is_admin
 from resonance_bot.states import AdminManagement, Broadcast, EventCreation, EventEdit
 from resonance_bot.utils.dates import combine_local, human_datetime, parse_date, parse_time
 from resonance_bot.utils.formatting import (
+    CHANNEL_LABELS,
     STATUS_LABELS,
     admin_event_card,
     event_announcement,
@@ -67,7 +68,7 @@ async def _authorized(
     settings: Settings,
 ) -> bool:
     async with session_factory() as session:
-        return await is_admin(session, user_id, settings.superadmin_id)
+        return await is_admin(session, user_id, settings.superadmin_ids)
 
 
 async def _guard_message(
@@ -102,7 +103,7 @@ async def admin_command(
         return
     await message.answer(
         "<b>Панель администратора</b>",
-        reply_markup=admin_menu(superadmin=message.from_user.id == settings.superadmin_id),
+        reply_markup=admin_menu(superadmin=message.from_user.id in settings.superadmin_ids),
     )
 
 
@@ -125,8 +126,37 @@ async def create_event_start(
     if not await _guard_message(message, session_factory, settings):
         return
     await state.clear()
-    await state.set_state(EventCreation.title)
-    await message.answer("Введи название мероприятия:")
+    await state.set_state(EventCreation.channel)
+    await message.answer("Где опубликовать мероприятие?", reply_markup=_channel_keyboard())
+
+
+def _channel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Основной канал", callback_data="create:channel:main")],
+            [InlineKeyboardButton(text="Тестовый канал", callback_data="create:channel:test")],
+        ]
+    )
+
+
+@router.callback_query(EventCreation.channel, F.data.startswith("create:channel:"))
+async def create_channel(callback: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    target = callback.data.rsplit(":", 1)[1]
+    try:
+        settings.channel_id_for(target)
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await state.update_data(publication_target=target)
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await _after_value(
+        callback.message,
+        state,
+        EventCreation.title,
+        "Введи название мероприятия:",
+        settings,
+    )
 
 
 async def _after_value(
@@ -379,7 +409,8 @@ def _creation_preview_text(data: dict, settings: Settings) -> str:
         else "выключен"
     )
     return (
-        "<b>Предпросмотр</b>\n\n"
+        "<b>Предпросмотр</b>\n"
+        f"Канал: {CHANNEL_LABELS[data.get('publication_target', 'main')]}\n\n"
         f"<b>{escape(data['title'])}</b>\n\n"
         f"{escape(data['description'])}\n\n"
         + (f"🎟 билет = {data['price']} ₽\n\n" if data["is_paid"] else "")
@@ -405,13 +436,18 @@ async def _show_creation_preview(
         ]
     )
     text = _creation_preview_text(data, settings)
-    if data.get("cover_file_id"):
+    # A photo caption has a smaller limit than a text message. Count the HTML
+    # source conservatively so entities and emoji cannot overflow the caption.
+    if data.get("cover_file_id") and len(text.encode("utf-16-le")) // 2 <= 1024:
         await message.answer_photo(data["cover_file_id"], caption=text, reply_markup=keyboard)
     else:
+        if data.get("cover_file_id"):
+            await message.answer_photo(data["cover_file_id"])
         await message.answer(text, reply_markup=keyboard)
 
 
 CREATE_FIELDS = {
+    "publication_target": ("Канал", EventCreation.channel),
     "title": ("Название", EventCreation.title),
     "description": ("Текст анонса", EventCreation.description),
     "event_type": ("Тип мероприятия", EventCreation.event_type),
@@ -457,7 +493,13 @@ async def creation_edit_field(callback: CallbackQuery, state: FSMContext) -> Non
     await callback.answer()
     await callback.message.answer(
         f"Введи новое значение поля «{label}»:",
-        reply_markup=_event_type_keyboard() if field == "event_type" else None,
+        reply_markup=(
+            _event_type_keyboard()
+            if field == "event_type"
+            else _channel_keyboard()
+            if field == "publication_target"
+            else None
+        ),
     )
 
 
@@ -480,6 +522,9 @@ async def _save_created_event(
     if not await _guard_callback(callback, session_factory, settings):
         return
     data = await state.get_data()
+    if data.get("publication_target") not in CHANNEL_LABELS:
+        await callback.answer("Сначала выберите канал публикации", show_alert=True)
+        return
     day = datetime.fromisoformat(data["event_date"]).date()
     starts_at = combine_local(day, parse_time(data["start_time"]), settings.tz)
     if starts_at <= datetime.now(UTC):
@@ -500,6 +545,7 @@ async def _save_created_event(
             map_url=data["map_url"],
             cover_file_id=data.get("cover_file_id"),
             capacity=data["capacity"],
+            publication_target=data["publication_target"],
             is_paid=data["is_paid"],
             price=positive_price(str(data["price"])) if data["is_paid"] else None,
             status=EventStatus.DRAFT,
@@ -519,7 +565,7 @@ async def _save_created_event(
             logger.exception("Could not publish created event %s", event_id)
             await callback.message.answer(
                 "Мероприятие сохранено как черновик, но публикация не удалась. "
-                "Проверь права бота в канале и настройки CHANNEL_ID."
+                "Проверь права бота в выбранном канале и MAIN_CHANNEL_ID / TEST_CHANNEL_ID."
             )
             return
         await callback.message.answer("Мероприятие опубликовано, регистрация открыта.")
@@ -880,7 +926,8 @@ async def admin_publish(
     except Exception:
         logger.exception("Could not publish event %s", event_id)
         await callback.message.answer(
-            "Не удалось опубликовать. Проверь права бота в канале и настройки CHANNEL_ID."
+            "Не удалось опубликовать. Проверь права бота в выбранном канале "
+            "и MAIN_CHANNEL_ID / TEST_CHANNEL_ID."
         )
         return
     await callback.message.answer("Мероприятие опубликовано, регистрация открыта.")
@@ -1340,7 +1387,7 @@ async def admin_management(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
-    if message.from_user.id != settings.superadmin_id:
+    if message.from_user.id not in settings.superadmin_ids:
         await message.answer("Управлять администраторами может только суперадминистратор.")
         return
     async with session_factory() as session:
@@ -1372,7 +1419,7 @@ async def admin_management_choice(
     state: FSMContext,
     settings: Settings,
 ) -> None:
-    if callback.from_user.id != settings.superadmin_id:
+    if callback.from_user.id not in settings.superadmin_ids:
         await callback.answer("Недостаточно прав", show_alert=True)
         return
     adding = callback.data == "admins:add"
@@ -1390,13 +1437,19 @@ async def add_admin(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
-    if message.from_user.id != settings.superadmin_id:
+    if message.from_user.id not in settings.superadmin_ids:
         await state.clear()
         return
     try:
         user_id = int(message.text or "")
     except ValueError:
         await message.answer("Нужен числовой Telegram ID.")
+        return
+    if user_id in settings.superadmin_ids:
+        await state.clear()
+        await message.answer(
+            "Суперадминистраторы задаются в .env; добавлять их в этот список не нужно."
+        )
         return
     async with session_factory() as session, session.begin():
         user = await session.get(User, user_id)
@@ -1420,7 +1473,7 @@ async def remove_admin(
     session_factory: async_sessionmaker[AsyncSession],
     settings: Settings,
 ) -> None:
-    if message.from_user.id != settings.superadmin_id:
+    if message.from_user.id not in settings.superadmin_ids:
         await state.clear()
         return
     try:
@@ -1428,8 +1481,10 @@ async def remove_admin(
     except ValueError:
         await message.answer("Нужен числовой Telegram ID.")
         return
-    if user_id == settings.superadmin_id:
-        await message.answer("Суперадминистратор задаётся в .env и не может удалить себя.")
+    if user_id in settings.superadmin_ids:
+        await message.answer(
+            "Суперадминистраторы задаются в .env; удалить их через это меню нельзя."
+        )
         await state.clear()
         return
     async with session_factory() as session, session.begin():

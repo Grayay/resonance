@@ -1,10 +1,16 @@
+import re
 from importlib.util import module_from_spec, spec_from_file_location
+from io import StringIO
 from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.schema import CreateColumn, CreateIndex
+
+from resonance_bot.db.base import Base
 
 
 def migration(name):
@@ -90,3 +96,73 @@ def test_payment_migration_preserves_legacy_data_and_downgrades():
             }
             assert "payment_receipts" not in sa.inspect(connection).get_table_names()
     engine.dispose()
+
+
+def test_publication_target_migration_preserves_existing_events_and_publications():
+    engine = sa.create_engine("sqlite://")
+    with engine.begin() as connection, Operations.context(MigrationContext.configure(connection)):
+        migration("0001_initial").upgrade()
+        migration("0002_event_payments").upgrade()
+        connection.execute(
+            sa.text(
+                "INSERT INTO events (id, title, description, starts_at, venue_name, address, "
+                "map_url, capacity, status, reminder_offsets_hours, created_by) VALUES "
+                "(1, 'Legacy', 'Description', '2030-01-01', 'Venue', 'Address', "
+                "'https://example.com', 1, 'DRAFT', '[]', 1)"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO channel_publications (event_id, channel_id, text_message_id) "
+                "VALUES (1, '-100123', 42)"
+            )
+        )
+        target = migration("0003_publication_target")
+        target.upgrade()
+        assert connection.scalar(sa.text("SELECT publication_target FROM events")) == "main"
+        connection.execute(sa.text("UPDATE events SET publication_target = 'test'"))
+        with pytest.raises(sa.exc.IntegrityError):
+            connection.execute(sa.text("UPDATE events SET publication_target = 'invalid'"))
+        assert connection.execute(
+            sa.text("SELECT channel_id, text_message_id FROM channel_publications")
+        ).one() == ("-100123", 42)
+        target.downgrade()
+        assert "publication_target" not in {
+            column["name"] for column in sa.inspect(connection).get_columns("events")
+        }
+        target.upgrade()
+        assert connection.scalar(sa.text("SELECT publication_target FROM events")) == "main"
+    engine.dispose()
+
+
+def test_postgresql_migrations_match_model_columns_indexes_and_named_constraints():
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    with Operations.context(context):
+        migration("0001_initial").upgrade()
+        migration("0002_event_payments").upgrade()
+        migration("0003_publication_target").upgrade()
+    sql = output.getvalue()
+
+    def normalize(value):
+        return " ".join(str(value).split())
+
+    dialect = postgresql.dialect()
+    for table in Base.metadata.sorted_tables:
+        match = re.search(rf"CREATE TABLE {table.name} \((.*?)\n\);", sql, re.S)
+        assert match is not None, table.name
+        additions = re.findall(rf"ALTER TABLE {table.name} ADD COLUMN ([^;]+);", sql)
+        table_sql = normalize(match[1] + " " + " ".join(additions))
+        for column in table.columns:
+            expected = normalize(CreateColumn(column).compile(dialect=dialect))
+            assert expected in table_sql, f"Missing PostgreSQL definition: {table.name}.{expected}"
+        for index in table.indexes:
+            assert normalize(CreateIndex(index).compile(dialect=dialect)) in normalize(sql)
+        for constraint in table.constraints:
+            if constraint.name:
+                assert f"CONSTRAINT {constraint.name}" in sql
+    assert "ADD COLUMN is_paid BOOLEAN DEFAULT false NOT NULL" in sql
+    assert "CREATE TYPE payment_status" not in sql  # Stored enum names use VARCHAR.

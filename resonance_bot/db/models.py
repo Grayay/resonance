@@ -108,6 +108,9 @@ class Event(Base):
     cover_file_id: Mapped[str | None] = mapped_column(String(512))
     is_paid: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     price: Mapped[int | None] = mapped_column(Integer)
+    publication_target: Mapped[str] = mapped_column(
+        String(8), default="main", server_default="main"
+    )
     capacity: Mapped[int] = mapped_column(Integer)
     status: Mapped[EventStatus] = mapped_column(
         Enum(EventStatus, name="event_status", native_enum=False),
@@ -127,6 +130,9 @@ class Event(Base):
 
     __table_args__ = (
         Index("ix_events_upcoming", "status", "starts_at"),
+        CheckConstraint(
+            "publication_target IN ('main', 'test')", name="ck_events_publication_target"
+        ),
         CheckConstraint(
             "(is_paid AND price IS NOT NULL AND price > 0) OR (NOT is_paid AND price IS NULL)",
             name="ck_events_payment_price",

@@ -32,8 +32,8 @@ async def ensure_user(
         await upsert_telegram_user(session, telegram_user)
 
 
-async def is_admin(session: AsyncSession, user_id: int, superadmin_id: int) -> bool:
-    if user_id == superadmin_id:
+async def is_admin(session: AsyncSession, user_id: int, superadmin_ids: set[int]) -> bool:
+    if user_id in superadmin_ids:
         return True
     return (
         await session.scalar(select(Admin.id).where(Admin.telegram_user_id == user_id))

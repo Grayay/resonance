@@ -42,15 +42,45 @@ tests/                тесты основных бизнес-правил
 
 1. Откройте [@BotFather](https://t.me/BotFather), выполните `/newbot`, задайте имя и username.
 2. Скопируйте токен бота — он понадобится как `BOT_TOKEN`.
-3. Узнайте свой числовой Telegram ID, например через [@userinfobot](https://t.me/userinfobot), и укажите его как `SUPERADMIN_ID`.
-4. Добавьте бота администратором канала. Ему нужны права публикации сообщений и редактирования своих сообщений.
-5. Узнайте `CHANNEL_ID`:
+3. Укажите числовые Telegram ID суперадминистраторов в `SUPERADMIN_IDS` через запятую. Узнать ID можно, например, через [@userinfobot](https://t.me/userinfobot).
+4. Добавьте одного и того же бота администратором основного и тестового каналов с правами публикации и редактирования своих сообщений.
+5. Узнайте `MAIN_CHANNEL_ID` и `TEST_CHANNEL_ID`:
    - у публичного канала можно использовать `@channel_username`;
    - для приватного канала нужен числовой ID вида `-100...` (его можно получить через Bot API `getUpdates` после пересылки/публикации тестового сообщения или с помощью служебного бота).
 6. Укажите username бота без `@` в `BOT_USERNAME`.
 7. Укажите контакт сообщества в `COMMUNITY_CONTACT`: `https://t.me/name` или `@name`.
 
 Кнопка «Поделиться» реализована стандартной Telegram share-ссылкой. Telegram не позволяет боту автоматически открыть системное окно выбора контакта через callback, поэтому пользователь переходит в нативный экран шаринга по URL.
+
+## Суперадминистраторы и каналы
+
+`SUPERADMIN_IDS=1312837656,2081888103` задаёт одинаковые полномочия обоим ID.
+Пробелы вокруг ID допускаются; пустые, отрицательные и некорректные ID отклоняются
+при запуске. Роль задаётся в `.env`, не требует записи в таблице администраторов
+и не может быть добавлена или удалена через обычное меню управления администраторами.
+
+`MAIN_CHANNEL_ID` и `TEST_CHANNEL_ID` принимают числовой ID канала или `@username`.
+При создании сначала выбирается «Основной канал» или «Тестовый канал».
+Ключ `main`/`test` сохраняется в `Event.publication_target`, включая черновики.
+До сохранения его можно изменить в предпросмотре; у сохранённого события он фиксирован.
+Оба канала используют одного бота, общую базу, регистрацию, оплату, очередь и напоминания.
+В публичный анонс служебная пометка о канале не добавляется.
+
+При публикации ключ разрешается через текущую конфигурацию; фактический канал
+сохраняется в `ChannelPublication.channel_id`. Удаление кнопок из ранее опубликованного
+поста использует именно сохранённый канал, даже если конфигурация впоследствии изменилась.
+При пустом `TEST_CHANNEL_ID` тестовая публикация недоступна; перенаправления в основной
+канал не происходит. В этом случае можно продолжать пользоваться основным каналом.
+
+Совместимость: если новые переменные отсутствуют, поддерживаются прежние
+`SUPERADMIN_ID=123456789` и `CHANNEL_ID=@my_channel`. Если указаны и новые,
+и прежние имена, предпочтение имеют новые. Рекомендуется перейти на новые имена.
+Для CSV-настроек нужен `pydantic-settings>=2.7`; установка пакета обновит зависимость.
+
+Перед запуском обновлённого бота выполните `alembic upgrade head`:
+миграция `0003_publication_target` назначает существующим событиям основной канал
+и сохраняет все ранее записанные каналы и ID опубликованных сообщений.
+Для списка суперадминистраторов изменений БД нет.
 
 ## Запуск через Docker Compose
 
@@ -64,9 +94,10 @@ cp .env.example .env
 
 ```dotenv
 BOT_TOKEN=123456:replace-me
-SUPERADMIN_ID=123456789
+SUPERADMIN_IDS=1312837656,2081888103
 DATABASE_URL=postgresql+asyncpg://resonance:change-me@db:5432/resonance
-CHANNEL_ID=@my_channel
+MAIN_CHANNEL_ID=@my_channel
+TEST_CHANNEL_ID=@my_test_channel
 COMMUNITY_CONTACT=https://t.me/my_contact
 TIMEZONE=Europe/Moscow
 BOT_USERNAME=my_resonance_bot
@@ -214,9 +245,10 @@ sudo chmod 600 /opt/resonance-bot/.env
 
 ```dotenv
 BOT_TOKEN=123456:replace-me
-SUPERADMIN_ID=123456789
+SUPERADMIN_IDS=1312837656,2081888103
 DATABASE_URL=postgresql+asyncpg://resonance:CHANGE_ME_STRONG_PASSWORD@127.0.0.1:5432/resonance
-CHANNEL_ID=@my_channel
+MAIN_CHANNEL_ID=@my_channel
+TEST_CHANNEL_ID=@my_test_channel
 COMMUNITY_CONTACT=https://t.me/my_contact
 TIMEZONE=Europe/Moscow
 BOT_USERNAME=my_resonance_bot
@@ -353,8 +385,8 @@ python -m compileall -q resonance_bot tests alembic
 
 1. Создать бота в BotFather и получить токен.
 2. Добавить бота в канал администратором с правами публикации и редактирования своих сообщений.
-3. Получить и настроить `CHANNEL_ID`.
-4. Заполнить `SUPERADMIN_ID`, `BOT_USERNAME`, `COMMUNITY_CONTACT` и остальные значения `.env`.
+3. Получить и настроить `MAIN_CHANNEL_ID` и `TEST_CHANNEL_ID`.
+4. Заполнить `SUPERADMIN_IDS`, `BOT_USERNAME`, `COMMUNITY_CONTACT` и остальные значения `.env`.
 5. Запустить PostgreSQL и приложение (`docker compose up --build -d` либо локально).
 6. Выполнить миграции (`alembic upgrade head`; в Compose это делает сервис `migrate`).
 7. Открыть бота через `/start`, затем проверить `/admin` и тестовую публикацию в канал.

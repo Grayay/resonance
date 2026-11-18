@@ -22,6 +22,8 @@ STATUS_LABELS = {
     EventStatus.CANCELLED: "Отменено",
 }
 
+CHANNEL_LABELS = {"main": "Основной", "test": "Тестовый"}
+
 
 def event_deep_link(event_id: int, settings: Settings) -> str:
     return f"{settings.deep_link_base}?start=event_{event_id}"
@@ -102,6 +104,7 @@ def admin_event_card(
         f"{human_datetime(event.starts_at, settings.tz)}\n"
         f"{escape(event.venue_name)}, {escape(event.address)}\n"
         f"Статус: <b>{STATUS_LABELS[event.status]}</b>\n"
+        f"Канал: {CHANNEL_LABELS[event.publication_target]}\n"
         f"Записано: <b>{active}/{event.capacity}</b>"
         + (
             f"\nЦена: {event.price} ₽\nОплатили: {paid} · Ожидают оплату: {pending}"

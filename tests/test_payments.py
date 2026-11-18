@@ -752,6 +752,7 @@ async def test_save_created_event_has_consistent_payment_fields(
     await state.set_state(EventCreation.preview)
     await state.update_data(
         title="Новое",
+        publication_target="main",
         description="Описание",
         event_date=day.isoformat(),
         start_time="18:00",

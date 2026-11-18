@@ -67,6 +67,7 @@ class NotificationService:
                 raise ValueError("Нельзя опубликовать прошедшее мероприятие")
             if event.published_at is not None:
                 raise ValueError("Мероприятие уже было опубликовано")
+            channel_id = self.settings.channel_id_for(event.publication_target)
             text = event_announcement(event, self.settings)
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -82,36 +83,30 @@ class NotificationService:
             text_message_id: int | None = None
             if event.cover_file_id and len(text) <= 900:
                 sent = await self.bot.send_photo(
-                    self.settings.channel_id,
+                    channel_id,
                     event.cover_file_id,
                     caption=text,
                     reply_markup=keyboard,
                 )
                 photo_message_id = sent.message_id
             elif len(text) <= 4000 and event.cover_file_id:
-                photo = await self.bot.send_photo(self.settings.channel_id, event.cover_file_id)
-                message = await self.bot.send_message(
-                    self.settings.channel_id, text, reply_markup=keyboard
-                )
+                photo = await self.bot.send_photo(channel_id, event.cover_file_id)
+                message = await self.bot.send_message(channel_id, text, reply_markup=keyboard)
                 photo_message_id = photo.message_id
                 text_message_id = message.message_id
             elif len(text) <= 4000:
-                message = await self.bot.send_message(
-                    self.settings.channel_id, text, reply_markup=keyboard
-                )
+                message = await self.bot.send_message(channel_id, text, reply_markup=keyboard)
                 text_message_id = message.message_id
             else:
                 if event.cover_file_id:
-                    photo = await self.bot.send_photo(
-                        self.settings.channel_id, event.cover_file_id
-                    )
+                    photo = await self.bot.send_photo(channel_id, event.cover_file_id)
                     photo_message_id = photo.message_id
                 await self.bot.send_message(
-                    self.settings.channel_id,
+                    channel_id,
                     f"<b>{escape(event.title)}</b>\n\n{escape(event.description)}",
                 )
                 message = await self.bot.send_message(
-                    self.settings.channel_id,
+                    channel_id,
                     event_schedule_cta(event, self.settings),
                     reply_markup=keyboard,
                 )
@@ -119,7 +114,7 @@ class NotificationService:
 
             publication = ChannelPublication(
                 event_id=event.id,
-                channel_id=self.settings.channel_id,
+                channel_id=channel_id,
                 photo_message_id=photo_message_id,
                 text_message_id=text_message_id,
             )
