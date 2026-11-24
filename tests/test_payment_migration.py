@@ -120,6 +120,17 @@ def test_publication_target_migration_preserves_existing_events_and_publications
         target = migration("0003_publication_target")
         target.upgrade()
         assert connection.scalar(sa.text("SELECT publication_target FROM events")) == "main"
+        connection.execute(sa.text("UPDATE events SET is_paid = 1, price = 500"))
+        details = migration("0004_event_payment_details")
+        details.upgrade()
+        assert connection.execute(
+            sa.text("SELECT is_paid, price, payment_details FROM events")
+        ).one() == (1, 500, None)
+        connection.execute(sa.text("UPDATE events SET payment_details = 'Bank'"))
+        details.downgrade()
+        assert "payment_details" not in {
+            column["name"] for column in sa.inspect(connection).get_columns("events")
+        }
         connection.execute(sa.text("UPDATE events SET publication_target = 'test'"))
         with pytest.raises(sa.exc.IntegrityError):
             connection.execute(sa.text("UPDATE events SET publication_target = 'invalid'"))
@@ -145,6 +156,7 @@ def test_postgresql_migrations_match_model_columns_indexes_and_named_constraints
         migration("0001_initial").upgrade()
         migration("0002_event_payments").upgrade()
         migration("0003_publication_target").upgrade()
+        migration("0004_event_payment_details").upgrade()
     sql = output.getvalue()
 
     def normalize(value):

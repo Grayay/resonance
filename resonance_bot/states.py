@@ -7,6 +7,7 @@ class EventCreation(StatesGroup):
     description = State()
     event_type = State()
     price = State()
+    payment_details = State()
     event_date = State()
     start_time = State()
     venue_name = State()

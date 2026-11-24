@@ -61,6 +61,8 @@ from resonance_bot.utils.formatting import (
 
 router = Router(name="admin")
 logger = logging.getLogger(__name__)
+PAYMENT_DETAILS_PROMPT = "Введите реквизиты для оплаты (например, номер телефона и банк):"
+PAYMENT_DETAILS_ERROR = "Реквизиты должны содержать от 1 до 3500 символов."
 
 
 async def _authorized(
@@ -226,7 +228,7 @@ async def create_type(callback: CallbackQuery, state: FSMContext, settings: Sett
     if value not in {"free", "paid"}:
         await callback.answer("Выберите тип кнопкой")
         return
-    await state.update_data(is_paid=value == "paid", price=None)
+    await state.update_data(is_paid=value == "paid", price=None, payment_details=None)
     await callback.answer()
     await callback.message.edit_reply_markup(reply_markup=None)
     if value == "paid":
@@ -249,7 +251,23 @@ async def create_price(message: Message, state: FSMContext, settings: Settings) 
     except ValueError:
         await message.answer("Цена должна быть положительным целым числом рублей.")
         return
-    await state.update_data(price=price)
+    data = await state.update_data(price=price)
+    if not data.get("payment_details"):
+        await state.set_state(EventCreation.payment_details)
+        await message.answer(PAYMENT_DETAILS_PROMPT)
+        return
+    await _after_value(
+        message, state, EventCreation.event_date, "Дата мероприятия в формате ДД.ММ.ГГГГ:", settings
+    )
+
+
+@router.message(EventCreation.payment_details)
+async def create_payment_details(message: Message, state: FSMContext, settings: Settings) -> None:
+    details = (message.text or "").strip()
+    if not 1 <= len(details) <= 3500:
+        await message.answer(PAYMENT_DETAILS_ERROR)
+        return
+    await state.update_data(payment_details=details)
     await _after_value(
         message,
         state,
@@ -451,6 +469,7 @@ CREATE_FIELDS = {
     "description": ("Текст анонса", EventCreation.description),
     "event_type": ("Тип мероприятия", EventCreation.event_type),
     "price": ("Цена", EventCreation.price),
+    "payment_details": ("Реквизиты для оплаты", EventCreation.payment_details),
     "event_date": ("Дата", EventCreation.event_date),
     "start_time": ("Время", EventCreation.start_time),
     "venue_name": ("Площадка", EventCreation.venue_name),
@@ -468,7 +487,7 @@ async def creation_edit(callback: CallbackQuery, state: FSMContext) -> None:
     builder = InlineKeyboardBuilder()
     data = await state.get_data()
     for field, (label, _) in CREATE_FIELDS.items():
-        if field == "price" and not data.get("is_paid"):
+        if field in {"price", "payment_details"} and not data.get("is_paid"):
             continue
         builder.button(text=label, callback_data=f"create:field:{field}")
     builder.adjust(2)
@@ -485,6 +504,9 @@ async def creation_edit_field(callback: CallbackQuery, state: FSMContext) -> Non
         return
     if field == "price" and not (await state.get_data()).get("is_paid"):
         await callback.answer("У бесплатного мероприятия нет цены", show_alert=True)
+        return
+    if field == "payment_details" and not (await state.get_data()).get("is_paid"):
+        await callback.answer("У бесплатного мероприятия нет реквизитов", show_alert=True)
         return
     label, target_state = definition
     await state.update_data(editing_preview=True)
@@ -524,6 +546,12 @@ async def _save_created_event(
     if data.get("publication_target") not in CHANNEL_LABELS:
         await callback.answer("Сначала выберите канал публикации", show_alert=True)
         return
+    if data["is_paid"] and not data.get("payment_details"):
+        await state.update_data(editing_preview=True)
+        await state.set_state(EventCreation.payment_details)
+        await callback.answer()
+        await callback.message.answer(PAYMENT_DETAILS_PROMPT)
+        return
     day = datetime.fromisoformat(data["event_date"]).date()
     starts_at = combine_local(day, parse_time(data["start_time"]), settings.tz)
     if starts_at <= datetime.now(UTC):
@@ -547,6 +575,7 @@ async def _save_created_event(
             publication_target=data["publication_target"],
             is_paid=data["is_paid"],
             price=positive_price(str(data["price"])) if data["is_paid"] else None,
+            payment_details=data.get("payment_details") if data["is_paid"] else None,
             status=EventStatus.DRAFT,
             reminder_offsets_hours=data["reminder_offsets_hours"],
             feedback_at=feedback_at,
@@ -1079,6 +1108,7 @@ EDIT_FIELDS = {
     "title": "Название",
     "description": "Текст анонса",
     "price": "Цена",
+    "payment_details": "Реквизиты для оплаты",
     "date": "Дата",
     "time": "Время",
     "venue_name": "Площадка",
@@ -1109,7 +1139,7 @@ async def admin_edit_event(
         return
     builder = InlineKeyboardBuilder()
     for field, label in EDIT_FIELDS.items():
-        if field == "price" and not event.is_paid:
+        if field in {"price", "payment_details"} and not event.is_paid:
             continue
         builder.button(text=label, callback_data=f"admin:editfield:{event_id}:{field}")
     builder.adjust(2)
@@ -1138,7 +1168,7 @@ async def admin_choose_edit_field(
     if not event:
         await callback.answer("Мероприятие не найдено", show_alert=True)
         return
-    if field not in EDIT_FIELDS or (field == "price" and not event.is_paid):
+    if field not in EDIT_FIELDS or (field in {"price", "payment_details"} and not event.is_paid):
         await callback.answer("Это поле недоступно для мероприятия", show_alert=True)
         return
     if field == "capacity" and event.published_at is not None:
@@ -1149,6 +1179,7 @@ async def admin_choose_edit_field(
     prompts = {
         "title": "Новое название:",
         "price": "Новая цена билета в рублях (положительное целое число):",
+        "payment_details": PAYMENT_DETAILS_PROMPT,
         "description": "Новый текст анонса:",
         "date": "Новая дата в формате ДД.ММ.ГГГГ:",
         "time": "Новое время в формате ЧЧ:ММ:",
@@ -1200,6 +1231,12 @@ async def admin_save_edit(
                 if not event.is_paid:
                     raise ValueError("У бесплатного мероприятия нет цены")
                 event.price = positive_price(raw)
+            elif field == "payment_details":
+                if not event.is_paid:
+                    raise ValueError("У бесплатного мероприятия нет реквизитов")
+                if not 1 <= len(raw) <= 3500:
+                    raise ValueError(PAYMENT_DETAILS_ERROR)
+                event.payment_details = raw
             elif field == "description":
                 if not raw or len(raw) > 3500:
                     raise ValueError("Текст должен содержать до 3500 символов")

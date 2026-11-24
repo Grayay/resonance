@@ -89,7 +89,7 @@ def registration_success(
     if event.is_paid and payment_pending:
         if payment_amount is None:
             raise ValueError("A paid registration must have a payment amount")
-        details = settings.payment_details.strip() or (
+        details = event.payment_details or (
             f"уточните у организатора {settings.community_contact}"
         )
         return (

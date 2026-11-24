@@ -167,6 +167,11 @@ async def fill_event(
         assert await creation.state.get_state() == EventCreation.price.state
         await creation.message("500")
         assert type((await creation.state.get_data())["price"]) is int
+        assert await creation.state.get_state() == EventCreation.payment_details.state
+        assert creation.outgoing[-1].text == (
+            "Введите реквизиты для оплаты (например, номер телефона и банк):"
+        )
+        await creation.message("Банк & получатель")
     assert await creation.state.get_state() == EventCreation.event_date.state
     await creation.message(
         (datetime.now(creation.settings.tz) + timedelta(days=7)).strftime("%d.%m.%Y")
@@ -199,6 +204,7 @@ async def test_complete_creation_flow(creation, session_factory, paid, publish, 
         assert event.is_paid == paid
         assert event.publication_target == target
         assert event.price == (500 if paid else None)
+        assert event.payment_details == ("Банк & получатель" if paid else None)
         assert event.status == (EventStatus.REGISTRATION_OPEN if publish else EventStatus.DRAFT)
         assert bool(event.published_at) == publish
         assert int(await session.scalar(select(func.count(ChannelPublication.id)))) == int(publish)
@@ -250,9 +256,13 @@ async def test_channel_can_change_in_preview_but_not_after_publication(creation,
     await creation.callback("create:channel:test")
     assert await creation.state.get_state() == EventCreation.preview.state
     assert (await creation.state.get_data())["price"] == 500
+    await creation.callback("create:field:payment_details")
+    await creation.message("Другой банк")
+    assert await creation.state.get_state() == EventCreation.preview.state
     await creation.callback("create:publish")
     async with session_factory() as session:
         event = await session.scalar(select(Event))
+        assert event.payment_details == "Другой банк"
     await creation.callback(f"admin:event:{event.id}:edit")
     await creation.callback(f"admin:editfield:{event.id}:publication_target")
     assert creation.requests[-1].show_alert
@@ -285,6 +295,10 @@ async def test_invalid_price_keeps_price_state(creation):
         assert (await creation.state.get_data())["price"] is None
     await creation.message("500")
     assert (await creation.state.get_data())["price"] == 500
+    assert await creation.state.get_state() == EventCreation.payment_details.state
+    await creation.message(photo=True)
+    assert await creation.state.get_state() == EventCreation.payment_details.state
+    await creation.message("Банк и получатель")
     assert await creation.state.get_state() == EventCreation.event_date.state
 
 

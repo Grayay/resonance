@@ -126,8 +126,8 @@ async def test_registration_confirmation(paid, make_event, service, session_fact
         event = await session.get(Event, event_id)
         if paid:
             event.price = 700
+            event.payment_details = "Банк & получатель"
 
-    settings = settings.model_copy(update={"payment_details": "Банк & получатель"})
     msg = message()
     await user._send_registration_success(msg, outcome.registration_id, session_factory, settings)
     confirmation = msg.answer.call_args.args[0]
@@ -648,11 +648,20 @@ async def test_price_edit_and_free_type_restriction(
     await admin.admin_save_edit(message(text="700", file_id=None), state, session_factory, settings)
     async with session_factory() as session:
         assert (await session.get(Event, event_id)).price == 700
+    cb = callback(f"admin:editfield:{event_id}:payment_details")
+    await admin.admin_choose_edit_field(cb, state, session_factory, settings)
+    assert await state.get_state() == EventEdit.value.state
+    await admin.admin_save_edit(
+        message(text="Новые реквизиты", file_id=None), state, session_factory, settings
+    )
+    async with session_factory() as session:
+        assert (await session.get(Event, event_id)).payment_details == "Новые реквизиты"
     free = await make_event(paid=False)
     await state.set_state(EventEdit.choosing)
-    cb = callback(f"admin:editfield:{free}:price")
-    await admin.admin_choose_edit_field(cb, state, session_factory, settings)
-    assert cb.answer.call_args.kwargs["show_alert"]
+    for field in ("price", "payment_details"):
+        cb = callback(f"admin:editfield:{free}:{field}")
+        await admin.admin_choose_edit_field(cb, state, session_factory, settings)
+        assert cb.answer.call_args.kwargs["show_alert"]
     assert await state.get_state() == EventEdit.choosing.state
 
 
@@ -667,7 +676,7 @@ async def test_creation_requires_explicit_type_and_price(state, settings):
     assert await state.get_state() == EventCreation.price.state
     await admin.create_price(message(text="500", file_id=None), state, settings)
     assert (await state.get_data())["price"] == 500
-    assert await state.get_state() == EventCreation.event_date.state
+    assert await state.get_state() == EventCreation.payment_details.state
 
 
 async def test_all_cancellation_entry_points_use_confirmation(
@@ -842,6 +851,7 @@ async def test_save_created_event_has_consistent_payment_fields(
         feedback_delay_hours=4,
         is_paid=paid,
         price=500 if paid else None,
+        payment_details="Банк и получатель" if paid else None,
     )
     await admin._save_created_event(
         callback("create:save"),
@@ -855,6 +865,7 @@ async def test_save_created_event_has_consistent_payment_fields(
         event = await session.scalar(select(Event))
     assert event.is_paid == paid
     assert event.price == (500 if paid else None)
+    assert event.payment_details == ("Банк и получатель" if paid else None)
 
 
 async def test_receipt_history_survives_new_payment_cycle(

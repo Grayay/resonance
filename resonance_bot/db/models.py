@@ -108,6 +108,7 @@ class Event(Base):
     cover_file_id: Mapped[str | None] = mapped_column(String(512))
     is_paid: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     price: Mapped[int | None] = mapped_column(Integer)
+    payment_details: Mapped[str | None] = mapped_column(Text)
     publication_target: Mapped[str] = mapped_column(
         String(8), default="main", server_default="main"
     )
