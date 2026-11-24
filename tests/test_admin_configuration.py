@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,7 +10,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from resonance_bot.config import Settings
-from resonance_bot.db.models import Admin
+from resonance_bot.db.models import Admin, Event, EventStatus
 from resonance_bot.handlers import admin
 from resonance_bot.services.users import is_admin
 from resonance_bot.states import AdminManagement
@@ -52,6 +53,51 @@ def message(actor, text=None):
 
 def state_for(actor):
     return FSMContext(MemoryStorage(), StorageKey(bot_id=1, chat_id=actor, user_id=actor))
+
+
+async def test_admin_event_lists_filter_before_pagination(event_id, session_factory, settings):
+    async with session_factory() as session, session.begin():
+        future = await session.get(Event, event_id)
+        future.status = EventStatus.DRAFT
+        for index in range(31):
+            session.add(
+                Event(
+                    title=f"Past {index}",
+                    description=future.description,
+                    starts_at=datetime.now(UTC) - timedelta(days=index + 1),
+                    venue_name=future.venue_name,
+                    address=future.address,
+                    map_url=future.map_url,
+                    capacity=1,
+                    status=EventStatus.FINISHED,
+                    created_by=1,
+                    reminder_offsets_hours=[],
+                )
+            )
+
+    def buttons(msg):
+        return [row[0] for row in msg.answer.call_args.kwargs["reply_markup"].inline_keyboard]
+
+    upcoming = message(1, "Мероприятия")
+    await admin.admin_events(upcoming, session_factory, settings)
+    assert [button.callback_data for button in buttons(upcoming)] == [
+        f"admin:event:{event_id}:view"
+    ]
+
+    past = message(1, "Прошедшие мероприятия")
+    await admin.admin_events(past, session_factory, settings)
+    assert [button.text.split(" · ")[0] for button in buttons(past)[:-1]] == [
+        f"Past {index}" for index in range(30)
+    ]
+    next_page = SimpleNamespace(
+        from_user=past.from_user,
+        message=past,
+        data=buttons(past)[-1].callback_data,
+        answer=AsyncMock(),
+    )
+    await admin.admin_events_page(next_page, session_factory, settings)
+    assert buttons(past)[0].text.startswith("Past 30 ·")
+    assert buttons(past)[1].callback_data == "admin:events:past:0"
 
 
 def test_dotenv_new_values_take_precedence_and_parse_csv(tmp_path):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from html import escape
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -46,7 +47,7 @@ from resonance_bot.services.registration import (
 )
 from resonance_bot.states import FeedbackComment, ReceiptSelection
 from resonance_bot.utils.dates import human_datetime
-from resonance_bot.utils.formatting import event_card, registration_success
+from resonance_bot.utils.formatting import event_card, fits_photo_caption, registration_success
 
 router = Router(name="user")
 PAGE_SIZE = 6
@@ -104,19 +105,30 @@ async def send_event_card(
         await message.answer("Это мероприятие не найдено или больше недоступно.")
         return
     now = datetime.now(UTC)
-    if as_utc(event.starts_at) <= now:
+    time_to_start = as_utc(event.starts_at) - now
+    if time_to_start <= timedelta(0):
         await message.answer("Это мероприятие уже прошло.")
         return
     text = event_card(event, settings, active=active, reserved=reserved)
+    contact_to_cancel = registered and time_to_start < timedelta(hours=24)
+    if contact_to_cancel:
+        text += (
+            "\n\nЕсли планы изменились и вы не сможете прийти, пожалуйста, "
+            "напишите организатору: "
+            f'<a href="{escape(settings.contact_url)}">{escape(settings.community_contact)}</a>'
+        )
     keyboard = event_keyboard(
         event,
         settings,
         registered=registered,
         full=active + reserved >= event.capacity,
+        allow_cancel=not contact_to_cancel,
     )
-    if event.cover_file_id:
+    if event.cover_file_id and (not contact_to_cancel or fits_photo_caption(text)):
         await message.answer_photo(event.cover_file_id, caption=text, reply_markup=keyboard)
     else:
+        if event.cover_file_id:
+            await message.answer_photo(event.cover_file_id)
         await message.answer(text, reply_markup=keyboard)
 
 

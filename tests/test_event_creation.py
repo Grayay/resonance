@@ -316,3 +316,12 @@ async def test_paid_preview_crosses_photo_caption_limit(creation, session_factor
     await creation.callback("create:save")
     async with session_factory() as session:
         assert (await session.scalar(select(Event))).price == 500
+
+
+async def test_creation_preview_keeps_caption_with_escaped_text(creation):
+    description = "🎉 Встреча & общение <вживую>. " * 27 + "До встречи!"
+    await fill_event(creation, paid=True, cover=True, description=description)
+    preview = creation.outgoing[-1]
+    assert preview.photo
+    assert preview.caption and len(preview.caption) > 1024
+    assert description in visible_text(preview.caption)

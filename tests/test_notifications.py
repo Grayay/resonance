@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
+from html import unescape
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -17,6 +19,7 @@ from resonance_bot.db.models import (
     RegistrationStatus,
 )
 from resonance_bot.services.notifications import NotificationService
+from resonance_bot.utils.formatting import event_announcement
 
 
 async def test_invitation_recipients_exclude_recent_registrations(
@@ -65,6 +68,40 @@ def publication_settings():
         community_contact="@organizer",
         bot_username="test_bot",
     )
+
+
+@pytest.mark.parametrize("paid", [False, True])
+@pytest.mark.parametrize("length", [980, 1024, 1025])
+async def test_publication_caption_boundary(
+    paid, length, event_id, session_factory, publication_settings
+):
+    sample = "🎉 Встреча & общение <вживую>. "
+    async with session_factory() as session, session.begin():
+        event = await session.get(Event, event_id)
+        event.cover_file_id = "cover"
+        event.is_paid, event.price = paid, 500 if paid else None
+        event.description = ""
+        base_text = event_announcement(event, publication_settings)
+        base_length = len(unescape(re.sub(r"<[^>]+>", "", base_text)))
+        event.description = (sample * length)[: length - base_length - 1] + "!"
+        announcement = event_announcement(event, publication_settings)
+        assert len(announcement) > 1024
+    bot = AsyncMock()
+    bot.send_photo.return_value = SimpleNamespace(message_id=1)
+    bot.send_message.return_value = SimpleNamespace(message_id=2)
+    service = NotificationService(bot, session_factory, publication_settings)
+    publication = await service.publish_event(event_id)
+
+    bot.send_photo.assert_awaited_once()
+    assert publication.photo_message_id == 1
+    if length <= 1024:
+        assert bot.send_photo.call_args.kwargs["caption"] == announcement
+        bot.send_message.assert_not_awaited()
+        assert publication.text_message_id is None
+    else:
+        assert "caption" not in bot.send_photo.call_args.kwargs
+        assert bot.send_message.call_args.args[1] == announcement
+        assert publication.text_message_id == 2
 
 
 @pytest.mark.parametrize("target", ["main", "test"])

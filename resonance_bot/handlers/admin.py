@@ -55,6 +55,7 @@ from resonance_bot.utils.formatting import (
     event_announcement,
     event_deep_link,
     event_schedule_cta,
+    fits_photo_caption,
     participant_line,
 )
 
@@ -436,9 +437,7 @@ async def _show_creation_preview(
         ]
     )
     text = _creation_preview_text(data, settings)
-    # A photo caption has a smaller limit than a text message. Count the HTML
-    # source conservatively so entities and emoji cannot overflow the caption.
-    if data.get("cover_file_id") and len(text.encode("utf-16-le")) // 2 <= 1024:
+    if data.get("cover_file_id") and fits_photo_caption(text):
         await message.answer_photo(data["cover_file_id"], caption=text, reply_markup=keyboard)
     else:
         if data.get("cover_file_id"):
@@ -600,6 +599,7 @@ async def creation_publish(
 
 
 @router.message(F.text == "Мероприятия")
+@router.message(F.text == "Прошедшие мероприятия")
 async def admin_events(
     message: Message,
     session_factory: async_sessionmaker[AsyncSession],
@@ -607,23 +607,58 @@ async def admin_events(
 ) -> None:
     if not await _guard_message(message, session_factory, settings):
         return
+    await _send_admin_events(message, session_factory, past=message.text == "Прошедшие мероприятия")
+
+
+@router.callback_query(F.data.regexp(r"^admin:events:(upcoming|past):\d+$"))
+async def admin_events_page(
+    callback: CallbackQuery,
+    session_factory: async_sessionmaker[AsyncSession],
+    settings: Settings,
+) -> None:
+    if not await _guard_callback(callback, session_factory, settings):
+        return
+    _, _, view, page = callback.data.split(":")
+    await callback.answer()
+    await _send_admin_events(callback.message, session_factory, past=view == "past", page=int(page))
+
+
+async def _send_admin_events(
+    message: Message,
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    past: bool,
+    page: int = 0,
+) -> None:
+    now = datetime.now(UTC)
+    page_size = 30
+    view = "past" if past else "upcoming"
     async with session_factory() as session:
         events = list(
             await session.scalars(
-                select(Event).order_by(Event.starts_at.desc()).limit(30)
+                select(Event)
+                .where(Event.starts_at < now if past else Event.starts_at >= now)
+                .order_by(Event.starts_at.desc(), Event.id.desc())
+                .offset(page * page_size)
+                .limit(page_size + 1)
             )
         )
-    if not events:
+    if not events and not page:
         await message.answer("Мероприятий пока нет.")
         return
     builder = InlineKeyboardBuilder()
-    for event in events:
+    for event in events[:page_size]:
         builder.button(
             text=f"{event.title} · {STATUS_LABELS[event.status]}",
             callback_data=f"admin:event:{event.id}:view",
         )
+    if page:
+        builder.button(text="← Назад", callback_data=f"admin:events:{view}:{page - 1}")
+    if len(events) > page_size:
+        builder.button(text="Дальше →", callback_data=f"admin:events:{view}:{page + 1}")
     builder.adjust(1)
-    await message.answer("<b>Мероприятия</b>", reply_markup=builder.as_markup())
+    title = "Прошедшие мероприятия" if past else "Мероприятия"
+    await message.answer(f"<b>{title}</b>", reply_markup=builder.as_markup())
 
 
 @router.callback_query(F.data.regexp(r"^admin:event:\d+:view$"))

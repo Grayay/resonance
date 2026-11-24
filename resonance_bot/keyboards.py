@@ -31,6 +31,7 @@ def admin_menu(*, superadmin: bool) -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text="Создать мероприятие")],
         [KeyboardButton(text="Мероприятия")],
+        [KeyboardButton(text="Прошедшие мероприятия")],
         [KeyboardButton(text="Рассылка")],
     ]
     if superadmin:
@@ -53,6 +54,7 @@ def event_keyboard(
     *,
     registered: bool = False,
     full: bool = False,
+    allow_cancel: bool = True,
 ) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     if event.map_url:
@@ -64,7 +66,8 @@ def event_keyboard(
             text="Позвать друга",
             url=f"https://t.me/share/url?url={link}&text={share_text}",
         )
-        builder.button(text="Не смогу", callback_data=f"cancel:ask:{event.id}")
+        if allow_cancel:
+            builder.button(text="Не смогу", callback_data=f"cancel:ask:{event.id}")
     elif event.status == EventStatus.REGISTRATION_OPEN:
         if full:
             builder.button(text="В лист ожидания", callback_data=f"wait:join:{event.id}")

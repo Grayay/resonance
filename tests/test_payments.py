@@ -48,7 +48,7 @@ from resonance_bot.services.payments import (
 )
 from resonance_bot.services.registration import RegistrationResult, as_utc
 from resonance_bot.states import EventCreation, EventEdit, FeedbackComment, ReceiptSelection
-from resonance_bot.utils.formatting import event_announcement
+from resonance_bot.utils.formatting import event_announcement, event_card
 
 
 @pytest.fixture
@@ -115,6 +115,83 @@ def callback(data, *, user_id=1, photo=False):
         answer=AsyncMock(),
         message=message(file_id="viewer" if photo else None),
     )
+
+
+@pytest.mark.parametrize("paid", [False, True])
+async def test_registration_confirmation(paid, make_event, service, session_factory, settings):
+    event_id = await make_event(paid=paid)
+    outcome = await service.register(event_id, 1)
+    assert outcome.result == RegistrationResult.REGISTERED
+    async with session_factory() as session, session.begin():
+        event = await session.get(Event, event_id)
+        if paid:
+            event.price = 700
+
+    settings = settings.model_copy(update={"payment_details": "Банк & получатель"})
+    msg = message()
+    await user._send_registration_success(msg, outcome.registration_id, session_factory, settings)
+    confirmation = msg.answer.call_args.args[0]
+    if paid:
+        assert confirmation == (
+            "Спасибо за запись! Вы записаны на «Клуб».\n\n"
+            "К оплате: 500 ₽\n"
+            "Реквизиты: Банк &amp; получатель\n\n"
+            "После оплаты пришлите, пожалуйста, скриншот чека в этот чат."
+        )
+    else:
+        date = user.human_datetime(event.starts_at, settings.tz)
+        day, time = date.split(", ")
+        assert confirmation == (
+            f"<b>Записал тебя!</b>\n\nКлуб\n{day}, начало в {time}\nКафе\nАдрес\n\n"
+            "Если планы поменяются — пожалуйста, нажми «Не смогу», и место перейдёт другому."
+        )
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [
+        timedelta(hours=25),
+        timedelta(hours=24),
+        timedelta(hours=24, seconds=-1),
+        timedelta(seconds=-1),
+    ],
+)
+async def test_registered_event_card_cancellation(
+    offset, make_event, service, session_factory, settings, monkeypatch
+):
+    now = datetime.now(UTC)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(user, "datetime", FixedDatetime)
+    event_id = await make_event()
+    assert (await service.register(event_id, 1)).result == RegistrationResult.REGISTERED
+    async with session_factory() as session, session.begin():
+        event = await session.get(Event, event_id)
+        event.starts_at = now + offset
+
+    msg = message()
+    await user.send_event_card(msg, event_id, 1, session_factory, settings)
+    if offset < timedelta(0):
+        msg.answer.assert_awaited_once_with("Это мероприятие уже прошло.")
+        return
+
+    text = msg.answer.call_args.args[0]
+    keyboard = msg.answer.call_args.kwargs["reply_markup"]
+    buttons = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+    original = event_card(event, settings, active=1)
+    if offset >= timedelta(hours=24):
+        assert f"cancel:ask:{event_id}" in buttons
+        assert text == original
+    else:
+        assert f"cancel:ask:{event_id}" not in buttons
+        assert text == (
+            original + "\n\nЕсли планы изменились и вы не сможете прийти, пожалуйста, "
+            'напишите организатору: <a href="https://t.me/admin">@admin</a>'
+        )
 
 
 def scheduler(session_factory, service, settings):
@@ -412,7 +489,8 @@ async def test_paid_waitlist_promotion_starts_payment_flow(
     cb = callback(f"offer:accept:{promotion.waitlist_entry_id}", user_id=2)
     await user.accept_offer(cb, service, session_factory, settings, Mock())
     assert (await registrations(session_factory))[1].payment_status == PaymentStatus.PENDING
-    assert PAYMENT_INSTRUCTION in cb.message.answer.call_args.args[0]
+    confirmation = cb.message.answer.call_args.args[0]
+    assert confirmation.endswith("После оплаты пришлите, пожалуйста, скриншот чека в этот чат.")
     assert (await service.register(event_id, 3)).result == RegistrationResult.FULL
 
 
@@ -618,7 +696,7 @@ async def test_repeat_register_keeps_received_payment(
     await attach_receipt(session_factory, reg.registration_id, 1, "original")
     cb = callback(f"event:register:{event_id}")
     await user.register(cb, service, session_factory, settings)
-    assert PAYMENT_INSTRUCTION not in cb.message.answer.call_args.args[0]
+    assert "К оплате:" not in cb.message.answer.call_args.args[0]
     stored = (await registrations(session_factory))[0]
     assert stored.payment_status == PaymentStatus.RECEIVED
     assert (await receipts(session_factory))[0].file_id == "original"

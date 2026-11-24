@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     )
     test_channel_id: str | None = None
     community_contact: str
+    payment_details: str = ""
     timezone: str = "Europe/Moscow"
     bot_username: str
     waitlist_offer_ttl_minutes: int = Field(default=120, ge=5, le=1440)

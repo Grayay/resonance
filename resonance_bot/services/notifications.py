@@ -28,6 +28,7 @@ from resonance_bot.utils.formatting import (
     event_announcement,
     event_deep_link,
     event_schedule_cta,
+    fits_photo_caption,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ class NotificationService:
             )
             photo_message_id: int | None = None
             text_message_id: int | None = None
-            if event.cover_file_id and len(text) <= 900:
+            if event.cover_file_id and fits_photo_caption(text):
                 sent = await self.bot.send_photo(
                     channel_id,
                     event.cover_file_id,

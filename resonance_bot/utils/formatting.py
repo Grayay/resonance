@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from html import escape
+import re
+from html import escape, unescape
 
 from resonance_bot.config import Settings
 from resonance_bot.db.models import (
@@ -23,6 +24,12 @@ STATUS_LABELS = {
 }
 
 CHANNEL_LABELS = {"main": "Основной", "test": "Тестовый"}
+
+
+def fits_photo_caption(text: str) -> bool:
+    # Strip generated HTML before decoding escaped user text. Telegram counts Unicode
+    # code points after entity parsing, while entity offsets use UTF-16 units.
+    return len(unescape(re.sub(r"<[^>]+>", "", text))) <= 1024
 
 
 def event_deep_link(event_id: int, settings: Settings) -> str:
@@ -80,11 +87,17 @@ def registration_success(
     payment_amount: int | None = None,
 ) -> str:
     if event.is_paid and payment_pending:
-        from resonance_bot.services.payments import payment_request
-
         if payment_amount is None:
             raise ValueError("A paid registration must have a payment amount")
-        return "<b>Место за вами!</b>\n\n" + payment_request(event, payment_amount)
+        details = settings.payment_details.strip() or (
+            f"уточните у организатора {settings.community_contact}"
+        )
+        return (
+            f"Спасибо за запись! Вы записаны на «{escape(event.title)}».\n\n"
+            f"К оплате: {payment_amount} ₽\n"
+            f"Реквизиты: {escape(details)}\n\n"
+            "После оплаты пришлите, пожалуйста, скриншот чека в этот чат."
+        )
     return (
         "<b>Записал тебя!</b>\n\n"
         f"{escape(event.title)}\n"
