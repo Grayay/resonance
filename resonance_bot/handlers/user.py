@@ -124,7 +124,7 @@ async def send_event_card(
         full=active + reserved >= event.capacity,
         allow_cancel=not contact_to_cancel,
     )
-    if event.cover_file_id and (not contact_to_cancel or fits_photo_caption(text)):
+    if event.cover_file_id and fits_photo_caption(text):
         await message.answer_photo(event.cover_file_id, caption=text, reply_markup=keyboard)
     else:
         if event.cover_file_id:

@@ -148,16 +148,26 @@ async def test_registration_confirmation(paid, make_event, service, session_fact
 
 
 @pytest.mark.parametrize(
-    "offset",
+    ("offset", "cover_description", "expect_caption"),
     [
-        timedelta(hours=25),
-        timedelta(hours=24),
-        timedelta(hours=24, seconds=-1),
-        timedelta(seconds=-1),
+        (timedelta(hours=25), None, False),
+        (timedelta(hours=24), None, False),
+        (timedelta(hours=24, seconds=-1), None, False),
+        (timedelta(seconds=-1), None, False),
+        (timedelta(hours=25), "x" * 1100, False),
+        (timedelta(hours=23), "x" * 1100, False),
+        (timedelta(hours=25), "Короткое описание", True),
     ],
 )
 async def test_registered_event_card_cancellation(
-    offset, make_event, service, session_factory, settings, monkeypatch
+    offset,
+    cover_description,
+    expect_caption,
+    make_event,
+    service,
+    session_factory,
+    settings,
+    monkeypatch,
 ):
     now = datetime.now(UTC)
 
@@ -172,6 +182,9 @@ async def test_registered_event_card_cancellation(
     async with session_factory() as session, session.begin():
         event = await session.get(Event, event_id)
         event.starts_at = now + offset
+        if cover_description is not None:
+            event.cover_file_id = "cover"
+            event.description = cover_description
 
     msg = message()
     await user.send_event_card(msg, event_id, 1, session_factory, settings)
@@ -179,8 +192,20 @@ async def test_registered_event_card_cancellation(
         msg.answer.assert_awaited_once_with("Это мероприятие уже прошло.")
         return
 
-    text = msg.answer.call_args.args[0]
-    keyboard = msg.answer.call_args.kwargs["reply_markup"]
+    if expect_caption:
+        msg.answer.assert_not_awaited()
+        msg.answer_photo.assert_awaited_once()
+        assert msg.answer_photo.call_args.args == ("cover",)
+        text = msg.answer_photo.call_args.kwargs["caption"]
+        keyboard = msg.answer_photo.call_args.kwargs["reply_markup"]
+    else:
+        if cover_description is not None:
+            msg.answer_photo.assert_awaited_once_with("cover")
+        else:
+            msg.answer_photo.assert_not_awaited()
+        msg.answer.assert_awaited_once()
+        text = msg.answer.call_args.args[0]
+        keyboard = msg.answer.call_args.kwargs["reply_markup"]
     buttons = [button.callback_data for row in keyboard.inline_keyboard for button in row]
     original = event_card(event, settings, active=1)
     if offset >= timedelta(hours=24):
